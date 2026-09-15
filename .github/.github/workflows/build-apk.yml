@@ -1,0 +1,111 @@
+name: Build Qusin AI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  JAVA_VERSION: "17"
+
+jobs:
+  verify-and-build:
+    name: Verify and build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;27.1.12297006
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test -- --runInBand
+
+      - name: Generate Android native project
+        run: npx expo prebuild --platform android --non-interactive
+
+      - name: Build unsigned release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Create CI signing key
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.QUSIN_CI_KEYSTORE_PASSWORD }}
+        run: |
+          PASSWORD="${KEYSTORE_PASSWORD:-qusin-ai-ci-only}"
+          keytool -genkeypair \
+            -keystore "${RUNNER_TEMP}/qusin-ci.keystore" \
+            -storepass "$PASSWORD" \
+            -keypass "$PASSWORD" \
+            -alias qusin-ci \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Qusin AI CI, OU=Build, O=Qusin AI, C=VN" \
+            -noprompt
+          echo "QUSIN_CI_KEYSTORE=${RUNNER_TEMP}/qusin-ci.keystore" >> "$GITHUB_ENV"
+          echo "QUSIN_CI_KEYSTORE_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Zipalign and sign APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS_VERSION="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          ZIPALIGN="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/zipalign"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          INPUT="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED="${RUNNER_TEMP}/qusin-ai-release-aligned.apk"
+          OUTPUT="${RUNNER_TEMP}/Qusin-AI-${GITHUB_RUN_NUMBER}.apk"
+
+          test -f "$INPUT"
+          "$ZIPALIGN" -f -v 4 "$INPUT" "$ALIGNED"
+          "$APKSIGNER" sign \
+            --ks "$QUSIN_CI_KEYSTORE" \
+            --ks-pass "pass:$QUSIN_CI_KEYSTORE_PASSWORD" \
+            --ks-key-alias qusin-ci \
+            --out "$OUTPUT" \
+            "$ALIGNED"
+          "$APKSIGNER" verify --verbose "$OUTPUT"
+          cp "$OUTPUT" "Qusin-AI-${GITHUB_RUN_NUMBER}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qusin-ai-apk-${{ github.run_number }}
+          path: Qusin-AI-${{ github.run_number }}.apk
+          if-no-files-found: error
+          retention-days: 14
